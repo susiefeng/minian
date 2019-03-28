@@ -41,19 +41,35 @@ try:
     import pycuda.autoinit
     import pycuda.gpuarray as gpuarray
     import skcuda.linalg as culin
-    
+
 except:
     print("cannot use cuda accelerate")
 
 
-def norm_params(param):
+# def load_params(param):
+#     try:
+#         param = ast.literal_eval(param)
+#     except (ValueError, SyntaxError):
+#         pass
+#     try:
+#         if re.search(r'^slice\([0-9]+, *[0-9]+ *,*[0-9]*\)$', param):
+#             param = eval(param)
+#     except TypeError:
+#         pass
+#     if type(param) is dict:
+#         param = {k: load_params(v) for k, v in param.items()}
+#     return param
+
+
+def load_params(param):
     try:
-        param = ast.literal_eval(param)
-    except (ValueError, SyntaxError):
+        param = eval(param)
+    except:
         pass
     if type(param) is dict:
-        param = {k: norm_params(v) for k, v in param.items()}
+        param = {k: load_params(v) for k, v in param.items()}
     return param
+
 
 def load_videos(vpath,
                 pattern='msCam[0-9]+\.avi$',
@@ -93,9 +109,9 @@ def load_videos(vpath,
         vpath + os.sep + v for v in os.listdir(vpath) if re.search(pattern, v)
     ])
     if not vlist:
-        print("No data with pattern {}"
-              " found in the specified folder {}".format(pattern, vpath))
-        return
+        raise FileNotFoundError(
+            "No data with pattern {}"
+            " found in the specified folder {}".format(pattern, vpath))
     print("loading {} videos in folder {}".format(len(vlist), vpath))
     varr_list = [load_avi_lazy(v) for v in vlist]
     varr = darr.concatenate(varr_list, axis=0)
@@ -143,7 +159,8 @@ def load_avi_perframe(fname, fid):
     cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
     ret, fm = cap.read()
     if ret:
-        return cv2.cvtColor(fm, cv2.COLOR_RGB2GRAY)
+        return np.flip(
+            cv2.cvtColor(fm, cv2.COLOR_RGB2GRAY), axis=0)
     else:
         print("frame read failed for frame {}".format(fid))
         return fm
@@ -606,20 +623,27 @@ def save_variable(var, fpath, fname, meta_dict=None):
     return ds
 
 
-def open_minian(dpath, fname='minian', backend='netcdf', chunks=None):
+def open_minian(dpath, fname='minian', backend='netcdf', chunks=None, post_process=None):
     if backend is 'netcdf':
         fname = fname + '.nc'
         if chunks is 'auto':
-            with xr.open_dataset(os.path.join(dpath, fname)) as ds:
-                dims = ds.dims
-            chunks = dict([(d, 'auto') for d in dims])
-        return xr.open_dataset(os.path.join(dpath, fname), chunks=chunks)
+            chunks = dict([(d, 'auto') for d in ds.dims])
+        mpath = pjoin(dpath, fname)
+        with xr.open_dataset(mpath) as ds:
+            dims = ds.dims
+        chunks = dict([(d, 'auto') for d in dims])
+        ds = xr.open_dataset(os.path.join(dpath, fname), chunks=chunks)
+        if post_process:
+            ds = post_process(ds, mpath)
+        return ds
     elif backend is 'zarr':
         mpath = pjoin(dpath, fname)
         dslist = [xr.open_zarr(pjoin(mpath, d)) for d in listdir(mpath) if isdir(pjoin(mpath, d))]
         ds = xr.merge(dslist)
         if chunks is 'auto':
             chunks = dict([(d, 'auto') for d in ds.dims])
+        if post_process:
+            ds = post_process(ds, mpath)
         return ds.chunk(chunks)
     else:
         raise NotImplementedError("backend {} not supported".format(backend))
@@ -633,10 +657,14 @@ def open_minian_mf(dpath, index_dims, result_format='xarray', pattern=r'minian\.
             continue
         flist = list(filter(lambda f: re.search(pattern, f), filelist + dirlist))
         if flist:
-            minian = open_minian(nextdir, fname=flist[-1], **kwargs)
+            print("opening dataset under {}".format(nextdir))
+            if len(flist) > 1:
+                warnings.warn("multiple dataset found: {}".format(flist))
+            fname = flist[-1]
+            print("opening {}".format(fname))
+            minian = open_minian(nextdir, fname=fname, **kwargs)
             key = tuple([np.array_str(minian[d].values) for d in index_dims])
             minian_dict[key] = minian
-            print("opening dataset under {}".format(nextdir))
             print(["{}: {}".format(d, v) for d, v in zip(index_dims, key)])
     if result_format is 'xarray':
         return xrconcat_recursive(minian_dict, index_dims)
@@ -699,19 +727,28 @@ def xrconcat_recursive(var_dict, dims):
         return xr.concat(var_dict.values(), dim=dims[0])
 
 
-def update_meta(dpath, pattern=r'^minian\.nc$', meta_dict=None):
+def update_meta(dpath, pattern=r'^minian\.nc$', meta_dict=None, backend='netcdf'):
     for dirpath, dirnames, fnames in os.walk(dpath):
-        fnames = filter(lambda fn: re.search(pattern, fn), fnames)
+        if backend == 'netcdf':
+            fnames = filter(lambda fn: re.search(pattern, fn), fnames)
+        elif backend == 'zarr':
+            fnames = filter(lambda fn: re.search(pattern, fn), dirnames)
+        else:
+            raise NotImplementedError("backend {} not supported".format(backend))
         for fname in fnames:
             f_path = os.path.join(dirpath, fname)
             pathlist = os.path.normpath(dirpath).split(os.sep)
             new_ds = xr.Dataset()
-            with xr.open_dataset(f_path) as old_ds:
-                new_ds.attrs = deepcopy(old_ds.attrs)
+            old_ds = open_minian(f_path, f_path, backend)
+            new_ds.attrs = deepcopy(old_ds.attrs)
+            old_ds.close()
             new_ds = new_ds.assign_coords(**dict([(
                 cdname,
                 pathlist[cdval]) for cdname, cdval in meta_dict.items()]))
-            new_ds.to_netcdf(f_path, mode='a')
+            if backend == 'netcdf':
+                new_ds.to_netcdf(f_path, mode='a')
+            elif backend == 'zarr':
+                new_ds.to_zarr(f_path, mode='w')
             print("updated: {}".format(f_path))
 
 
